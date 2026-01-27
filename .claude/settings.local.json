@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m venv:*)",
+      "Bash(\"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\python.exe\" -m pip install --upgrade pip setuptools wheel)",
+      "Bash(\"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\pip.exe\" install \"numpy<2.0\")",
+      "Bash(\"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\pip.exe\" install alpaca-py \"alpaca_trade_api>=2.1.0\" \"ccxt>=1.66.32\" gputil gymnasium \"importlib-metadata>=6.0,<=8.5.0\" jqdatasdk lz4 matplotlib \"pandas>=1.1.5\" pandas_market_calendars pyfolio-reloaded pytest \"ray[default]\" \"ray[tune]\" \"scikit-learn>=0.21.0\" scipy selenium SQLAlchemy \"stable-baselines3[extra]\" \"stockstats>=0.4.0\" tensorboard webdriver-manager wrds yfinance torch)",
+      "Bash(\"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\pip.exe\" install -e \"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\" --no-deps)",
+      "Bash(\"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\pip.exe\" list)",
+      "Bash(findstr:*)",
+      "Bash(tree:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(venv\\\\Scripts\\\\pip install:*)",
+      "Bash(c:UsersANSLDesktopFinRLvenvScriptspip.exe install sb3-contrib)",
+      "Bash(cmd.exe /c \"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\pip.exe install sb3-contrib\")",
+      "Bash(cmd.exe /c \"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\pip.exe install sb3-contrib 2>&1\")",
+      "Bash(cmd.exe /c \"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\python.exe -m pip install sb3-contrib\")",
+      "Bash(powershell.exe -Command \"& ''c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\python.exe'' -m pip install sb3-contrib\")"
+    ]
+  }
+}

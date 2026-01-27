@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda create:*)",
+      "Bash(\"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\venv\\\\Scripts\\\\pip.exe\" install -r \"c:\\\\Users\\\\ANSL\\\\Desktop\\\\FinRL\\\\requirements.txt\" --ignore-requires-python)"
+    ]
+  }
+}

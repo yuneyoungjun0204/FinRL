@@ -1,0 +1,132 @@
+# 가상환경 및 패키지
+venv/
+env/
+ENV/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 데이터 파일 (큰 파일들)
+*.npz
+*.npy
+*.csv
+*.parquet
+*.h5
+*.hdf5
+*.feather
+
+# 모델 파일 (학습된 모델들)
+*.zip
+*.pkl
+*.pickle
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+trained_models/
+models/
+checkpoints/
+
+# 학습 결과 및 로그
+results/
+logs/
+*.log
+tensorboard/
+wandb/
+mlruns/
+
+# Jupyter 노트북 체크포인트
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 빌드 및 배포
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+*.egg
+
+# 테스트 및 커버리지
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# 문서 빌드
+docs/_build/
+site/
+
+# Git
+.git/
+.gitignore
+
+# 환경 변수 및 설정
+.env
+.env.local
+config_private.py
+
+# 기타
+.DS_Store
+*.sage.py
+celerybeat-schedule
+*.manifest
+*.spec
+
+# 이벤트 파일
+*events.out.tfevents.*
+
+# 히스토리
+.history/
+
+# Cursor 설정 (중복 방지)
+.cursor/
+
+# Docker
+docker/
+
+# 큰 바이너리 파일
+*.so
+*.dylib
+*.dll
+
+# 압축 파일
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# 이미지 (필요시 주석 해제)
+# *.png
+# *.jpg
+# *.jpeg
+# *.gif
+
+# 음성/비디오 파일
+*.mp3
+*.mp4
+*.avi
+*.mov
+
+# 데이터베이스
+*.db
+*.sqlite
+*.sqlite3
+
+# 백업 파일
+*.bak
+*.backup
+*~
