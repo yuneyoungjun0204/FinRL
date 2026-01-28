@@ -3,11 +3,15 @@
 Leverage Pro - 30x Isolated Margin Scalping RL Environment
 ================================================================================
 보상 함수 설계 원칙:
-1. Sparse Reward: 매 스텝 보상 ≈ 0, 거래 이벤트 시에만 의미있는 보상
+1. Equity-Change Reward: reward = delta(equity) / initial_equity
+   → 실제 자산 변화와 보상이 직결되어 Reward Hacking 원천 차단
 2. VecNormalize: 자동 보상 스케일링으로 Value Function 안정화
-3. 에피소드 종료 보너스: 전체 에피소드 성과 평가
-4. 과매매 방지: 거래 진입 비용
-5. 청산 강력 페널티
+3. 거래 쿨다운: 연속 매매 방지 (최소 5스텝 간격)
+4. 청산 추가 페널티: 자산 손실분 + -0.5 추가 억제
+5. 손절(SL) 추가 페널티: -0.15 (손절선까지 끌려가는 행위 억제)
+6. 관망 보상: +0.0002/스텝 (확실하지 않으면 쉬는 게 이득)
+7. 에피소드 조기 종료: -20% 드로다운 시 즉시 truncation
+8. 에피소드 생존 보너스: ROI 비례 (최대 ±0.3)
 
 청산 조건: Isolated Margin 30x에서 약 3.33% 역행 시 청산
 
@@ -22,11 +26,12 @@ import matplotlib.pyplot as plt
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import torch as th
 import platform
 import time
+import os
 
 # ==========================================
 # 1. 학습 모니터링 콜백
@@ -57,6 +62,25 @@ TEST_SYMBOL = "ADAUSDT"
 # 모델 아키텍처 설정 ("MLP" 또는 "LSTM")
 # ==========================================
 MODEL_TYPE = "LSTM"
+
+# ==========================================
+# 커리큘럼 학습 설정 (ML-Agents --initialize-from 방식)
+# ==========================================
+# RUN_ID: 현재 학습의 고유 ID (모델 저장 경로)
+#   예: "Stage1_Basic", "Stage2_Advanced"
+RUN_ID = "Stage1_Basic"
+
+# INITIALIZE_FROM: 이전 학습 모델 경로 (None이면 처음부터 학습)
+#   예: "Stage1_Basic" → runs/Stage1_Basic/ 에서 모델 로드 후 이어서 학습
+#   ML-Agents의 --initialize-from=Stage1_Basic 과 동일
+INITIALIZE_FROM = None
+
+# 저장 경로
+RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+SAVE_DIR = os.path.join(RUNS_DIR, RUN_ID)
+
+# 체크포인트 저장 간격 (timesteps 단위)
+CHECKPOINT_FREQ = 100000
 
 
 def fetch_raw_ohlcv(exchange, symbol, timeframe, total_limit):
@@ -177,7 +201,7 @@ exchange = ccxt.bybit()
 all_symbol_data = {}
 
 for sym in sorted(set(TRAIN_SYMBOLS + [TEST_SYMBOL])):
-    all_symbol_data[sym] = fetch_symbol_data(exchange, sym, total_limit=10000)
+    all_symbol_data[sym] = fetch_symbol_data(exchange, sym, total_limit=60000)
     time.sleep(1)  # API rate limit 방지
 
 # 학습 데이터 구성 (각 종목 앞 80%)
@@ -214,76 +238,64 @@ if platform.system() == 'Windows':
 plt.rcParams['axes.unicode_minus'] = False
 
 # ==========================================
-# 3. Sparse Reward 설계 (보상 발산 방지)
+# 3. Equity-Change Reward (Reward Hacking 원천 차단)
 # ==========================================
-class SparseRewardCalculator:
+class EquityChangeRewardCalculator:
     """
-    Sparse Reward: 이벤트 기반 보상으로 누적 보상 발산 방지
+    Equity-Change Reward: reward = delta(equity) / initial_equity
 
-    문제: 매 스텝 [-1,1] 클리핑해도 600+ 스텝 에피소드에서
-          누적 보상이 -600까지 발산 → Value Function 붕괴
-
-    해결:
-    1. 매 스텝 보상 ≈ 0 (미세한 시간 비용만)
-    2. 거래 종료 시에만 의미있는 보상 (PnL 기반)
-    3. 에피소드 종료 시 전체 성과 보너스
-    4. VecNormalize가 자동으로 보상 스케일링
+    설계 원칙:
+    1. 보상 = 실제 자산 변화 → Reward Hacking 원천 차단
+       (자산이 줄면 보상도 반드시 줄어듦)
+    2. tanh 압축 없음 → 큰 손실 = 비례하는 큰 음수 보상
+       (기존: -100% 손실이나 -10% 손실이나 비슷한 보상)
+    3. 수수료가 자산을 깎음 → 과매매 시 자연적 보상 감소
+    4. VecNormalize가 자동 스케일링 담당
     """
 
     def __init__(self, leverage=30):
         self.leverage = leverage
-        self.trade_count = 0
         self.initial_equity = 100.0
+        self.prev_equity = 100.0
 
     def reset(self, initial_equity):
-        self.trade_count = 0
         self.initial_equity = initial_equity
+        self.prev_equity = initial_equity
 
-    def calculate_reward(self, pnl_pct=0, is_new_trade=False,
-                         is_liquidated=False, has_position=True,
-                         action=0.0, is_episode_end=False,
-                         survived=True, final_equity=0):
+    def calculate_reward(self, curr_equity, is_liquidated=False,
+                         is_sl_exit=False, has_position=True,
+                         is_episode_end=False, survived=True):
         """
-        Sparse Reward: 대부분의 스텝에서 보상 ≈ 0
+        보상 = (현재 자산 - 이전 자산) / 초기 자산
 
-        보상 구성:
-        - 거래 종료: np.tanh(pnl_pct / 10) → 핵심 학습 신호
-        - 청산: -1.0 (강력한 페널티)
-        - 스텝 비용: ±0.001 (관망 vs 보유)
-        - 거래 진입: -0.002 (과매매 방지)
-        - 에피소드 종료: ROI 기반 보너스 (최대 ±0.5)
+        추가 신호:
+        - 청산: -0.5 추가 페널티
+        - 손절(SL): -0.15 추가 페널티 (손절선까지 가지 않도록 학습)
+        - 관망: +0.0002 (확실하지 않으면 쉬는 게 이득)
+        - 에피소드 생존: ROI 비례 보너스 (최대 ±0.3)
         """
-        # 1) 청산: 강력한 페널티
+        # 핵심: 자산 변화율 (실제 PnL과 직결)
+        equity_change = (curr_equity - self.prev_equity) / self.initial_equity
+        reward = equity_change
+
+        # 청산 추가 페널티 (자산 손실분 + 추가 억제)
         if is_liquidated:
-            return -1.0
+            reward -= 0.5
 
-        reward = 0.0
+        # 손절 추가 페널티 (SL선까지 끌려가는 행위 억제)
+        if is_sl_exit:
+            reward -= 0.15
 
-        # 2) 거래 종료 이벤트 (핵심 학습 신호, sparse)
-        #    pnl_pct가 0이 아닌 경우 = 포지션이 청산된 스텝
-        #    tanh(pnl_pct / 10): 10% 수익 → 0.76, -10% → -0.76
-        if pnl_pct != 0:
-            reward += np.tanh(pnl_pct / 10)
+        # 관망 보상 ("확실하지 않으면 쉬는 게 이득")
+        if not has_position:
+            reward += 0.0002
 
-        # 3) 미세한 스텝 비용 (에피소드 누적 시에도 작은 값 유지)
-        if has_position:
-            reward -= 0.001  # 포지션 보유 비용 (기회비용)
-        else:
-            reward += 0.0005  # 관망 시 자산 보호 보너스
-            reward += np.exp(-5.0 * action ** 2) * 0.001  # hold 행동 유도
+        # 에피소드 생존 보너스 (전체 성과 평가)
+        if is_episode_end and survived:
+            roi = (curr_equity - self.initial_equity) / self.initial_equity
+            reward += np.clip(roi, -0.3, 0.3)
 
-        # 4) 거래 진입 비용 (과매매 방지)
-        if is_new_trade:
-            self.trade_count += 1
-            reward -= 0.002
-
-        # 5) 에피소드 종료 보너스 (전체 에피소드 성과 평가)
-        #    에피소드를 끝까지 생존한 경우에만 부여
-        if is_episode_end and survived and final_equity > 0:
-            roi = (final_equity - self.initial_equity) / self.initial_equity
-            reward += np.tanh(roi * 5) * 0.5
-
-        # VecNormalize가 스케일링 담당 → 클리핑 불필요
+        self.prev_equity = curr_equity
         return reward
 
 
@@ -297,7 +309,7 @@ class LeverageProEnv(gym.Env):
     Multi-Dataset: reset() 시 랜덤 종목 선택으로 학습 다양성 확보
     State: 정규화된 기술적 지표 (5m:9 + 1h:9 = 18) + 포지션 상태 (4)
     Action: [-1, 1] (음수=숏, 양수=롱, 0근처=관망)
-    Reward: Sparse (이벤트 기반) + VecNormalize 자동 스케일링
+    Reward: Equity-Change (자산 변화 기반) + VecNormalize 자동 스케일링
     """
 
     def __init__(self, datasets, stats,
@@ -317,13 +329,16 @@ class LeverageProEnv(gym.Env):
         self.liquidation_pct = 1.0 / leverage
 
         # 손절/익절 설정
-        self.stop_loss_pct = 0.0035      # 2% 손절
-        self.take_profit_pct = 0.01    # 3% 익절
-        self.trailing_activation = 0.01  # 2% 수익 시 트레일링 활성화
-        self.trailing_callback = 0.002   # 0.5% 콜백
+        self.stop_loss_pct = 0.02      # 2% 손절
+        self.take_profit_pct = 0.03    # 3% 익절
+        self.trailing_activation = 0.02  # 2% 수익 시 트레일링 활성화
+        self.trailing_callback = 0.005   # 0.5% 콜백
 
-        # 보상 계산기 (Sparse Reward)
-        self.reward_calc = SparseRewardCalculator(leverage=leverage)
+        # 과매매 방지: 거래 간 최소 쿨다운 (5스텝 = 25분)
+        self.trade_cooldown = 5
+
+        # 보상 계산기 (Equity-Change)
+        self.reward_calc = EquityChangeRewardCalculator(leverage=leverage)
 
         # 첫 번째 데이터셋으로 shape 결정
         self.price_array, self.tech_array = self.datasets[0]
@@ -381,6 +396,7 @@ class LeverageProEnv(gym.Env):
 
         self.trades = []
         self.prev_action = 0
+        self.last_trade_time = -self.trade_cooldown
 
         self.reward_calc.reset(self.initial_capital)
 
@@ -435,8 +451,8 @@ class LeverageProEnv(gym.Env):
         action = float(actions[0])
 
         pnl_pct = 0
-        is_new_trade = False
         is_liquidated = False
+        is_sl_exit = False
 
         # 포지션 관리
         if self.position != 0:
@@ -454,6 +470,7 @@ class LeverageProEnv(gym.Env):
             # 손절
             elif price_change <= -self.stop_loss_pct:
                 pnl_pct, _ = self._close_position("SL_EXIT")
+                is_sl_exit = True
             # 익절
             elif price_change >= self.take_profit_pct:
                 pnl_pct, _ = self._close_position("TP_EXIT")
@@ -473,30 +490,29 @@ class LeverageProEnv(gym.Env):
                 if abs(action) < 0.3 or (action * self.position < 0):
                     pnl_pct, _ = self._close_position("AI_EXIT")
 
-        # 신규 진입
-        line=0.8
-        if self.position == 0 and abs(action) > line and self.cash >= self.entry_size:
+        # 신규 진입 (쿨다운 적용: 연속 매매 방지)
+        line = 0.8
+        cooldown_ok = (self.time - self.last_trade_time) >= self.trade_cooldown
+        if self.position == 0 and abs(action) > line and self.cash >= self.entry_size and cooldown_ok:
             self._open_position(action)
-            is_new_trade = True
+            self.last_trade_time = self.time
 
         # 총 자산 업데이트
         self.total_asset = self.cash + (self.entry_size if self.position != 0 else 0) + self.unrealized_pnl
 
-        # 파산 체크 및 에피소드 종료 판정 (보상 계산 전에 결정)
-        is_alive = self.total_asset > 10.0
+        # 드로다운 체크 및 에피소드 종료 판정 (-20% 이상 손실 시 즉시 종료)
+        is_alive = self.total_asset >= self.initial_capital * 0.40
         is_episode_end = self.time >= self.max_step
         done = is_episode_end or not is_alive
 
-        # Sparse Reward 계산
+        # Equity-Change Reward 계산
         reward = self.reward_calc.calculate_reward(
-            pnl_pct=pnl_pct,
-            is_new_trade=is_new_trade,
+            curr_equity=self.total_asset,
             is_liquidated=is_liquidated,
+            is_sl_exit=is_sl_exit,
             has_position=(self.position != 0),
-            action=action,
             is_episode_end=is_episode_end,
-            survived=(is_alive and is_episode_end),
-            final_equity=self.total_asset if done else 0
+            survived=(is_alive and is_episode_end)
         )
 
         self.prev_action = action
@@ -545,26 +561,60 @@ PPO_HYPERPARAMS = dict(
 )
 
 
-def create_model(env, model_type="MLP"):
+def create_model(env, model_type="LSTM", initialize_from=None):
     """
-    모델 아키텍처 생성
+    모델 생성 또는 이전 학습에서 로드 (커리큘럼 학습 지원)
 
     Args:
         env: VecNormalize로 래핑된 학습 환경
         model_type: "MLP" 또는 "LSTM"
+        initialize_from: 이전 RUN_ID (None이면 새로 생성)
+            예: "Stage1_Basic" → runs/Stage1_Basic/best_model.zip 로드
 
     Returns:
         PPO 또는 RecurrentPPO 모델
     """
+    # --- initialize-from: 이전 모델에서 가중치 로드 ---
+    if initialize_from is not None:
+        prev_dir = os.path.join(RUNS_DIR, initialize_from)
+        prev_model_path = os.path.join(prev_dir, "best_model.zip")
+
+        if not os.path.exists(prev_model_path):
+            raise FileNotFoundError(
+                f"초기화 모델을 찾을 수 없습니다: {prev_model_path}\n"
+                f"'{initialize_from}' 학습이 완료되었는지 확인하세요."
+            )
+
+        if model_type == "LSTM":
+            from sb3_contrib import RecurrentPPO
+            model = RecurrentPPO.load(prev_model_path, env=env)
+            print(f"\n🧠 모델: RecurrentPPO (LSTM)")
+        else:
+            model = PPO.load(prev_model_path, env=env)
+            print(f"\n🧠 모델: PPO (MLP)")
+
+        print(f"   📂 initialize-from: {initialize_from}")
+        print(f"   📂 로드 경로: {prev_model_path}")
+
+        # VecNormalize 통계도 로드 (있으면)
+        prev_vecnorm_path = os.path.join(prev_dir, "vecnormalize.pkl")
+        if os.path.exists(prev_vecnorm_path):
+            env = VecNormalize.load(prev_vecnorm_path, env.venv)
+            model.set_env(env)
+            print(f"   📂 VecNormalize 통계 로드 완료")
+
+        return model
+
+    # --- 새 모델 생성 ---
     if model_type == "LSTM":
         from sb3_contrib import RecurrentPPO
         model = RecurrentPPO(
             "MlpLstmPolicy", env,
             policy_kwargs=LSTM_POLICY_KWARGS,
-            learning_rate=1e-4,  # LSTM은 낮은 LR이 안정적
+            learning_rate=1e-4,
             **PPO_HYPERPARAMS
         )
-        print(f"\n🧠 모델: RecurrentPPO (LSTM)")
+        print(f"\n🧠 모델: RecurrentPPO (LSTM) — 새로 생성")
         print(f"   Input(22) → LSTM(128) → Dense(128) → LeakyReLU → Action(1)")
         print(f"   Actor LSTM + Critic LSTM (독립)")
     else:
@@ -574,7 +624,7 @@ def create_model(env, model_type="MLP"):
             learning_rate=2e-4,
             **PPO_HYPERPARAMS
         )
-        print(f"\n🧠 모델: PPO (MLP)")
+        print(f"\n🧠 모델: PPO (MLP) — 새로 생성")
         print(f"   Input(22) → Dense(256) → LeakyReLU → Dense(128) → LeakyReLU → Action(1)")
 
     return model
@@ -593,12 +643,15 @@ print(f"📐 피처: 5m(9) + 1h(9) = 18 + 포지션(4) = 22차원 상태")
 print(f"🧠 모델 아키텍처: {MODEL_TYPE}")
 print(f"⚡ 레버리지: 30x (Isolated)")
 print(f"🎯 청산 임계값: {100/30:.2f}% 역행")
-print("\n💡 보상 함수 구성 (Sparse Reward + VecNormalize):")
-print("   - 거래 종료: tanh(pnl_pct/10) — 핵심 학습 신호")
-print("   - 청산: -1.0 강력 페널티")
-print("   - 스텝 비용: ±0.001 (보유 vs 관망)")
-print("   - 거래 진입: -0.002 (과매매 방지)")
-print("   - 에피소드 종료: ROI 기반 보너스 (최대 ±0.5)")
+print(f"💾 RUN_ID: {RUN_ID}" + (f" (initialize-from: {INITIALIZE_FROM})" if INITIALIZE_FROM else ""))
+print("\n💡 보상 함수 구성 (Equity-Change + VecNormalize):")
+print("   - 매 스텝: delta(equity) / initial_equity — 실제 자산 변화 직결")
+print("   - 청산: 자산 손실 + 추가 -0.5 페널티")
+print("   - 손절(SL): 자산 손실 + 추가 -0.15 페널티")
+print("   - 관망 보상: +0.0002/스텝 (쉬는 게 이득)")
+print("   - 과매매 방지: 수수료 자연 억제 + 5스텝 쿨다운")
+print("   - 에피소드 조기 종료: -20% 드로다운 시 truncation")
+print("   - 에피소드 생존: ROI 비례 보너스 (최대 ±0.3)")
 print("   - VecNormalize: 자동 보상 스케일링")
 print("=" * 60)
 
@@ -612,20 +665,41 @@ train_env = DummyVecEnv([lambda: LeverageProEnv(train_datasets, data_stats, leve
 train_env = VecNormalize(train_env, norm_obs=False, norm_reward=True,
                          clip_reward=10.0, gamma=0.98)
 
-# 모델 생성 (MODEL_TYPE에 따라 MLP 또는 LSTM)
-model = create_model(train_env, MODEL_TYPE)
-total_timesteps_num = 700000
+# 모델 생성 또는 이전 모델에서 로드
+model = create_model(train_env, MODEL_TYPE, initialize_from=INITIALIZE_FROM)
+total_timesteps_num = 1000000
+
+# 저장 디렉토리 생성
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# 콜백: 모니터링 + 체크포인트 (중단해도 모델 보존)
+callback = RewardMonitorCallback()
+checkpoint_cb = CheckpointCallback(
+    save_freq=CHECKPOINT_FREQ,
+    save_path=os.path.join(SAVE_DIR, "checkpoints"),
+    name_prefix=RUN_ID,
+    save_vecnormalize=True,
+)
 
 # 학습
-print("\n🏋️ 학습 시작...")
-callback = RewardMonitorCallback()
-model.learn(total_timesteps=total_timesteps_num, callback=callback)
+init_msg = f" (initialize-from: {INITIALIZE_FROM})" if INITIALIZE_FROM else " (새로 시작)"
+print(f"\n🏋️ 학습 시작...{init_msg}")
+print(f"   💾 저장 경로: {SAVE_DIR}")
+print(f"   💾 체크포인트: {CHECKPOINT_FREQ:,} 스텝마다 자동 저장")
+model.learn(total_timesteps=total_timesteps_num, callback=[callback, checkpoint_cb])
+
+# 학습 완료 후 최종 모델 저장
+model.save(os.path.join(SAVE_DIR, "best_model"))
+train_env.save(os.path.join(SAVE_DIR, "vecnormalize.pkl"))
+print(f"\n💾 최종 모델 저장 완료:")
+print(f"   📂 {os.path.join(SAVE_DIR, 'best_model.zip')}")
+print(f"   📂 {os.path.join(SAVE_DIR, 'vecnormalize.pkl')}")
 
 # 학습 곡선
 plt.figure(figsize=(12, 4))
 plt.plot(callback.episode_rewards, alpha=0.7)
 plt.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-plt.title("Training Reward per Episode (Sparse + VecNormalize)")
+plt.title("Training Reward per Episode (Equity-Change + VecNormalize)")
 plt.xlabel("Episode")
 plt.ylabel("Total Reward")
 plt.grid(True, alpha=0.3)
@@ -704,7 +778,7 @@ ax3.grid(True, alpha=0.3)
 ax4 = fig.add_subplot(gs[1, 1])
 ax4.plot(np.cumsum(results['rewards']), color='orange', lw=2)
 ax4.axhline(0, color='red', ls='--', alpha=0.5)
-ax4.set_title("4. Cumulative Reward (Sparse)")
+ax4.set_title("4. Cumulative Reward (Equity-Change)")
 ax4.grid(True, alpha=0.3)
 
 # 5. 거래 효율성
@@ -756,7 +830,7 @@ if exits:
 
     # 누적 보상 통계
     total_reward = sum(results['rewards'])
-    print(f"\n🏆 누적 보상: {total_reward:.3f} (Sparse, 원본값)")
+    print(f"\n🏆 누적 보상: {total_reward:.3f} (Equity-Change, 원본값)")
     print(f"   - 최대: {max(results['rewards']):.3f}")
     print(f"   - 최소: {min(results['rewards']):.3f}")
     print(f"   - 평균: {np.mean(results['rewards']):.4f}")
