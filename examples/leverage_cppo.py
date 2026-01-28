@@ -5,7 +5,7 @@ Leverage CPPO - Constrained PPO (Lagrangian) for 30x Leveraged Scalping
 기반: leverage_pro.py의 V2 환경 + Lagrangian Constrained PPO
 
 핵심 개념: 보상(Reward)과 비용(Cost)을 분리
-- Reward: Equity-Change + Hindsight (수익 극대화)
+- Reward: Equity-Change + Sharpe Ratio + Hindsight (수익 극대화 + 안정성)
 - Cost: 제약 위반 시 비용 발생 (리스크 관리)
 - Lagrangian: effective_reward = reward - λ × cost
   → λ는 제약 위반에 따라 자동 조절
@@ -22,6 +22,11 @@ B. 매매 빈도 제약 (Transaction Cost Constraint)
 C. 사후 평가 연동 (Hindsight-based Cost)
    → 기회비용 상실 > 2% 시 cost 발생
    → "너무 일찍 파는 것"을 규칙 위반으로 간주
+
+Sharpe Ratio 강화:
+- 매 스텝: 변동성(최근 50스텝 std) 기반 미세 페널티 → 과도한 리스크 억제
+- 에피소드 종료: rolling Sharpe Ratio 보너스 → 안정적 수익 유도
+- "큰 수익 + 큰 변동" < "적당한 수익 + 낮은 변동"
 
 Lagrangian 작동 원리:
 - λ = 0에서 시작 (일반 PPO와 동일)
@@ -68,26 +73,30 @@ CHECKPOINT_FREQ = 100000
 # 사후 평가 (V2 기반)
 USE_HINDSIGHT = True
 HINDSIGHT_STEPS = 20
-HINDSIGHT_SCALE = 0.5       # 0.3→0.5: "더 버텨서 큰 수익"이 유리하도록 강화
+HINDSIGHT_SCALE = 1.0       # 0.5→1.0: "더 버텨서 큰 수익" 리워드 대폭 상향
+
+# 홀딩 보상 (사후 평가 Reward 보강 — 비용이 아닌 이득으로 유혹)
+HOLDING_REWARD_SCALE = 0.02 # 수익 중 포지션 보유 시 스텝당 보상
 
 # ==========================================
 # CPPO 제약 설정
 # ==========================================
 # A. 드로다운 제약: 고점 대비 N% 초과 시 cost 발생
 DRAWDOWN_COST_THRESHOLD = 0.10    # 10% 드로다운 초과 시
-DRAWDOWN_COST_SCALE = 5.0         # cost 증폭 계수
+DRAWDOWN_COST_SCALE = 2.0         # 5.0→2.0: 드로다운 cost 압도 방지
 
 # B. 매매 빈도 제약: 손실 매매 시 cost 발생
 MIN_PROFIT_PCT = 0.0              # 0% 미만 = 손실 매매
+SL_EXIT_COST_MULTIPLIER = 5.0     # SL_EXIT 시 cost ×5 폭증 (어설픈 버티기 억제)
 
 # C. 사후 평가 연동: 기회비용 > N% 시 cost 발생
-HINDSIGHT_COST_THRESHOLD = 0.02   # 2% 초과 기회비용
+HINDSIGHT_COST_THRESHOLD = 0.03   # 0.02→0.03: cost C 완화 (reward로 유도)
 
 # Lagrangian 승수 설정
 COST_LIMIT = 0.20                 # 에피소드 평균 cost 상한 (0.15→0.20: 추세 추종 여유)
-LAMBDA_LR = 0.05                  # λ 학습률
+LAMBDA_LR = 0.02                  # 0.05→0.02: λ가 너무 빨리 최대치 도달 방지
 LAMBDA_MAX = 10.0                 # λ 최대값
-LAMBDA_UPDATE_FREQ = 20           # λ 업데이트 주기 (에피소드)
+LAMBDA_UPDATE_FREQ = 40           # 20→40: 충분한 탐색 후 업데이트
 
 
 # ==========================================
@@ -508,12 +517,15 @@ class LeverageProEnvV3(LeverageProEnvV2):
     def __init__(self, datasets, stats, leverage=35, initial_capital=100.0,
                  entry_size=5.0, hindsight_steps=20, hindsight_scale=0.3,
                  drawdown_threshold=0.10, drawdown_cost_scale=5.0,
-                 min_profit_pct=0.0, hindsight_cost_threshold=0.02):
+                 min_profit_pct=0.0, hindsight_cost_threshold=0.02,
+                 sl_exit_cost_multiplier=5.0, holding_reward_scale=0.02):
         # Cost 설정
         self.drawdown_threshold = drawdown_threshold
         self.drawdown_cost_scale = drawdown_cost_scale
         self.min_profit_pct = min_profit_pct
         self.hindsight_cost_threshold = hindsight_cost_threshold
+        self.sl_exit_cost_multiplier = sl_exit_cost_multiplier
+        self.holding_reward_scale = holding_reward_scale
 
         # Lagrangian 승수 (LagrangianCallback이 동적으로 조절)
         self.cost_lambda = 0.0
@@ -522,6 +534,7 @@ class LeverageProEnvV3(LeverageProEnvV2):
         self._peak_equity = initial_capital
         self._episode_cost = 0.0
         self._last_missed_gain_pct = 0.0
+        self._last_exit_reason = ""
 
         super().__init__(datasets, stats, leverage, initial_capital,
                          entry_size, hindsight_steps, hindsight_scale)
@@ -531,7 +544,13 @@ class LeverageProEnvV3(LeverageProEnvV2):
         self._peak_equity = self.initial_capital
         self._episode_cost = 0.0
         self._last_missed_gain_pct = 0.0
+        self._last_exit_reason = ""
         return obs, info
+
+    def _close_position(self, reason="EXIT"):
+        """V2 + 종료 사유 기록 (SL_EXIT 비용 폭증용)"""
+        self._last_exit_reason = reason
+        return super()._close_position(reason)
 
     def _calculate_hindsight_reward(self, exit_price, position_side):
         """V2 사후 평가 + Cost C용 기회비용(missed_gain_pct) 기록"""
@@ -586,10 +605,13 @@ class LeverageProEnvV3(LeverageProEnvV2):
             cost_a = (drawdown - self.drawdown_threshold) * self.drawdown_cost_scale
 
         # B. 매매 빈도 제약: 손실 매매 시 cost 부과
+        #    SL_EXIT인 경우 cost ×N 폭증 → "어설프게 버티다 손절" 억제
         if self._last_exit_happened:
             pnl_pct = info.get('pnl_pct', 0)
             if pnl_pct < self.min_profit_pct:
                 cost_b = abs(self.min_profit_pct - pnl_pct) / 100
+                if self._last_exit_reason == "SL_EXIT":
+                    cost_b *= self.sl_exit_cost_multiplier
 
         # C. 사후 평가 연동: 기회비용 > 임계값 시 cost 부과
         if self._last_exit_happened and self._last_missed_gain_pct > self.hindsight_cost_threshold:
@@ -600,6 +622,13 @@ class LeverageProEnvV3(LeverageProEnvV2):
 
         # Lagrangian: effective_reward = reward - λ × cost
         reward -= self.cost_lambda * step_cost
+
+        # === 홀딩 보상: 수익 중인 포지션 보유 시 양의 보상 ===
+        # "비용으로 겁주기" 대신 "이득으로 유혹"하여 홀딩 기간 연장
+        if self.position != 0 and self.unrealized_pnl > 0:
+            profit_ratio = self.unrealized_pnl / self.entry_size
+            holding_bonus = profit_ratio * self.holding_reward_scale
+            reward += holding_bonus
 
         # info에 cost 정보 기록 (콜백에서 모니터링용)
         info['cost'] = step_cost
@@ -867,7 +896,8 @@ print(f"💾 RUN_ID: {RUN_ID}" + (f" (initialize-from: {INITIALIZE_FROM})" if IN
 print(f"\n🛡️ CPPO 제약 설정:")
 print(f"   A. 드로다운 제약: >{DRAWDOWN_COST_THRESHOLD*100:.0f}% 초과 시 cost "
       f"(scale={DRAWDOWN_COST_SCALE})")
-print(f"   B. 매매 손실 제약: <{MIN_PROFIT_PCT:.1f}% 수익 시 cost")
+print(f"   B. 매매 손실 제약: <{MIN_PROFIT_PCT:.1f}% 수익 시 cost "
+      f"(SL_EXIT ×{SL_EXIT_COST_MULTIPLIER:.0f})")
 print(f"   C. 기회비용 제약: >{HINDSIGHT_COST_THRESHOLD*100:.0f}% 상실 시 cost")
 print(f"   λ 설정: limit={COST_LIMIT}, lr={LAMBDA_LR}, "
       f"max={LAMBDA_MAX}, update_freq={LAMBDA_UPDATE_FREQ}")
@@ -876,6 +906,7 @@ print(f"\n💡 보상 함수 구성 (Equity-Change + Sharpe + Hindsight + CPPO):
 print("   - 매 스텝: delta(equity) / initial_equity — 실제 자산 변화 직결")
 print("   - 매 스텝: 변동성 페널티 (-std × 0.01) — 과도한 리스크 억제")
 print(f"   - 사후 평가(Hindsight): 기회비용/리스크회피 보상 (scale={HINDSIGHT_SCALE})")
+print(f"   - 홀딩 보상: 수익 중 포지션 유지 시 +보상 (scale={HOLDING_REWARD_SCALE})")
 print("   - 에피소드 종료: Sharpe Ratio 보너스 (안정적 수익 유도)")
 print("   - CPPO: reward -= λ × cost (λ 자동 조절)")
 print("   - VecNormalize: 자동 보상 스케일링")
@@ -889,7 +920,9 @@ def make_train_env():
         drawdown_threshold=DRAWDOWN_COST_THRESHOLD,
         drawdown_cost_scale=DRAWDOWN_COST_SCALE,
         min_profit_pct=MIN_PROFIT_PCT,
-        hindsight_cost_threshold=HINDSIGHT_COST_THRESHOLD
+        hindsight_cost_threshold=HINDSIGHT_COST_THRESHOLD,
+        sl_exit_cost_multiplier=SL_EXIT_COST_MULTIPLIER,
+        holding_reward_scale=HOLDING_REWARD_SCALE,
     )
 
 print(f"\n🔬 환경: LeverageProEnvV3 (CPPO + Hindsight)")
