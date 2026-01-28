@@ -872,9 +872,11 @@ print(f"   C. 기회비용 제약: >{HINDSIGHT_COST_THRESHOLD*100:.0f}% 상실 �
 print(f"   λ 설정: limit={COST_LIMIT}, lr={LAMBDA_LR}, "
       f"max={LAMBDA_MAX}, update_freq={LAMBDA_UPDATE_FREQ}")
 
-print(f"\n💡 보상 함수 구성 (Equity-Change + Hindsight + CPPO):")
+print(f"\n💡 보상 함수 구성 (Equity-Change + Sharpe + Hindsight + CPPO):")
 print("   - 매 스텝: delta(equity) / initial_equity — 실제 자산 변화 직결")
-print("   - 사후 평가(Hindsight): 기회비용/리스크회피 보상")
+print("   - 매 스텝: 변동성 페널티 (-std × 0.01) — 과도한 리스크 억제")
+print(f"   - 사후 평가(Hindsight): 기회비용/리스크회피 보상 (scale={HINDSIGHT_SCALE})")
+print("   - 에피소드 종료: Sharpe Ratio 보너스 (안정적 수익 유도)")
 print("   - CPPO: reward -= λ × cost (λ 자동 조절)")
 print("   - VecNormalize: 자동 보상 스케일링")
 print("=" * 60)
