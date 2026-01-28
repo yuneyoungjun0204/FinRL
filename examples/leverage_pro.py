@@ -82,6 +82,13 @@ SAVE_DIR = os.path.join(RUNS_DIR, RUN_ID)
 # 체크포인트 저장 간격 (timesteps 단위)
 CHECKPOINT_FREQ = 100000
 
+# ==========================================
+# 사후 평가 (Hindsight Evaluation) 설정
+# ==========================================
+USE_HINDSIGHT = True        # True: V2 환경 사용, False: V1 환경 사용
+HINDSIGHT_STEPS = 20        # 종료 후 관찰할 미래 스텝 수 (20스텝 = 100분)
+HINDSIGHT_SCALE = 0.3       # 사후 평가 보상 가중치 (0~1)
+
 
 def fetch_raw_ohlcv(exchange, symbol, timeframe, total_limit):
     """Raw OHLCV 데이터 수집"""
@@ -524,6 +531,114 @@ class LeverageProEnv(gym.Env):
 
 
 # ==========================================
+# 4-1. V2: 사후 평가 환경 (Hindsight Evaluation)
+# ==========================================
+class LeverageProEnvV2(LeverageProEnv):
+    """
+    V2: 포지션 종료 후 향후 N스텝 가격을 참조하여 사후 평가 보상 추가
+
+    1. 잠재 수익 상실 패널티 (Opportunity Cost Penalty)
+       - 롱 익절 후 가격이 더 올랐다면 "너무 일찍 팔았다" → 패널티
+       - 숏 익절 후 가격이 더 떨어졌다면 "너무 일찍 청산" → 패널티
+
+    2. 리스크 회피 보상 (Risk Avoidance Reward)
+       - 롱 청산 후 가격이 급락했다면 "최적 타이밍 탈출" → 보너스
+       - 숏 청산 후 가격이 급등했다면 "최적 타이밍 탈출" → 보너스
+
+    설계: 백테스트 환경이므로 미래 데이터 참조 가능 (학습 시에만 사용)
+    """
+
+    def __init__(self, datasets, stats, leverage=35, initial_capital=100.0,
+                 entry_size=5.0, hindsight_steps=20, hindsight_scale=0.3):
+        self.hindsight_steps = hindsight_steps
+        self.hindsight_scale = hindsight_scale
+        self._last_exit_happened = False
+        self._last_exit_price = 0.0
+        self._last_exit_side = 0
+        super().__init__(datasets, stats, leverage, initial_capital, entry_size)
+
+    def reset(self, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+        self._last_exit_happened = False
+        self._last_exit_price = 0.0
+        self._last_exit_side = 0
+        return obs, info
+
+    def _close_position(self, reason="EXIT"):
+        """포지션 종료 시 사후 평가용 정보 기록"""
+        self._last_exit_price = self.price_array[self.time][0]
+        self._last_exit_side = 1 if self.position > 0 else -1
+        self._last_exit_happened = True
+        return super()._close_position(reason)
+
+    def _calculate_hindsight_reward(self, exit_price, position_side):
+        """
+        사후 평가 보상 계산
+
+        향후 N스텝의 가격 흐름을 관찰하여:
+        - 유리한 방향 최값 → 잠재 수익 상실 패널티
+        - 불리한 방향 최값 → 리스크 회피 보너스
+
+        Returns:
+            opportunity_penalty + risk_bonus (스케일링 적용)
+        """
+        future_start = self.time + 1
+        future_end = min(self.time + self.hindsight_steps + 1, len(self.price_array))
+        if future_end <= future_start:
+            return 0.0
+
+        future_prices = self.price_array[future_start:future_end, 0]
+
+        if position_side > 0:  # 롱이었다면
+            best_favorable = np.max(future_prices)   # 향후 최고가 (더 올랐나?)
+            worst_adverse = np.min(future_prices)     # 향후 최저가 (떨어졌나?)
+        else:  # 숏이었다면
+            best_favorable = np.min(future_prices)   # 향후 최저가 (더 떨어졌나?)
+            worst_adverse = np.max(future_prices)     # 향후 최고가 (올랐나?)
+
+        # 1) 잠재 수익 상실 패널티
+        #    롱: (향후 최고가 - 종료가) / 종료가  → 양수면 기회 상실
+        #    숏: (종료가 - 향후 최저가) / 종료가  → 양수면 기회 상실
+        if position_side > 0:
+            missed_gain_pct = (best_favorable - exit_price) / exit_price
+        else:
+            missed_gain_pct = (exit_price - best_favorable) / exit_price
+
+        opportunity_penalty = -max(missed_gain_pct, 0)
+
+        # 2) 리스크 회피 보상
+        #    롱: (종료가 - 향후 최저가) / 종료가  → 양수면 잘 빠져나옴
+        #    숏: (향후 최고가 - 종료가) / 종료가  → 양수면 잘 빠져나옴
+        if position_side > 0:
+            avoided_loss_pct = (exit_price - worst_adverse) / exit_price
+        else:
+            avoided_loss_pct = (worst_adverse - exit_price) / exit_price
+
+        risk_bonus = max(avoided_loss_pct, 0)
+
+        # 레버리지 + 포지션 비율로 보상 스케일 맞춤 (equity-change와 동일 단위)
+        scale = self.leverage * (self.entry_size / self.initial_capital)
+        hindsight_reward = (opportunity_penalty + risk_bonus) * scale * self.hindsight_scale
+
+        return hindsight_reward
+
+    def step(self, actions):
+        self._last_exit_happened = False
+
+        obs, reward, done, truncated, info = super().step(actions)
+
+        # 포지션이 종료됐으면 사후 평가 보상 합산
+        if self._last_exit_happened:
+            hindsight = self._calculate_hindsight_reward(
+                self._last_exit_price, self._last_exit_side
+            )
+            reward += hindsight
+            info['hindsight_reward'] = hindsight
+
+        return obs, reward, done, truncated, info
+
+
+# ==========================================
 # 5. 모델 아키텍처 모듈
 # ==========================================
 
@@ -653,15 +768,24 @@ print("   - 과매매 방지: 수수료 자연 억제 + 5스텝 쿨다운")
 print("   - 에피소드 조기 종료: -20% 드로다운 시 truncation")
 print("   - 에피소드 생존: ROI 비례 보너스 (최대 ±0.3)")
 print("   - VecNormalize: 자동 보상 스케일링")
+if USE_HINDSIGHT:
+    print(f"   - 사후 평가(Hindsight): {HINDSIGHT_STEPS}스텝 관찰, scale={HINDSIGHT_SCALE}")
 print("=" * 60)
 
-# 환경 생성 (Multi-Dataset + VecNormalize)
-# DummyVecEnv로 래핑 후 VecNormalize 적용
-# norm_obs=False: 관측값은 자체 Z-Score 정규화 사용
-# norm_reward=True: 보상을 자동으로 running std로 나눠 Value Function 안정화
-# clip_reward=10.0: 정규화 후 안전 클리핑
-# gamma=0.98: PPO gamma와 동일하게 설정
-train_env = DummyVecEnv([lambda: LeverageProEnv(train_datasets, data_stats, leverage=30)])
+# 환경 생성 (V1 또는 V2)
+if USE_HINDSIGHT:
+    def make_train_env():
+        return LeverageProEnvV2(
+            train_datasets, data_stats, leverage=30,
+            hindsight_steps=HINDSIGHT_STEPS, hindsight_scale=HINDSIGHT_SCALE
+        )
+    print(f"\n🔬 환경: LeverageProEnvV2 (Hindsight Evaluation)")
+else:
+    def make_train_env():
+        return LeverageProEnv(train_datasets, data_stats, leverage=30)
+    print(f"\n🔬 환경: LeverageProEnv (V1)")
+
+train_env = DummyVecEnv([make_train_env])
 train_env = VecNormalize(train_env, norm_obs=False, norm_reward=True,
                          clip_reward=10.0, gamma=0.98)
 
@@ -710,6 +834,7 @@ plt.show()
 # 6. 테스트
 # ==========================================
 print(f"\n🧪 테스트 시작... ({TEST_SYMBOL})")
+# 테스트는 V1 사용 (사후 평가는 학습 시에만 — 실전에서는 미래 데이터 없음)
 test_env = LeverageProEnv([(test_prices, test_techs)], data_stats, leverage=30)
 obs, _ = test_env.reset()
 
