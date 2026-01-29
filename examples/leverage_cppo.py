@@ -79,25 +79,48 @@ HINDSIGHT_SCALE = 1.0       # 0.5→1.0: "더 버텨서 큰 수익" 리워드 �
 HOLDING_REWARD_SCALE = 0.02 # 수익 중 포지션 보유 시 스텝당 보상
 
 # ==========================================
-# CPPO 제약 설정 (v2 - 스케일 수정)
+# CPPO 제약 설정 (v5 - 극단적 단타 봉쇄 + 추세 강제)
 # ==========================================
-# A. 드로다운 제약: 거래 종료 시 드로다운 상태면 cost 발생 (스텝당 → 거래당)
-DRAWDOWN_COST_THRESHOLD = 0.10    # 10% 드로다운 초과 시
-DRAWDOWN_COST_SCALE = 1.0         # 거래당 1회만 부과되므로 스케일 단순화
+# v5 핵심: 추세를 거스르는 것 자체가 "금지된 행동"
+# 1. 최소 100스텝(~8시간) 강제 홀딩
+# 2. 수수료 미달 수익 시 Cost 100배
+# 3. 추세 역행 진입 시 즉시 최대 Cost
+# 4. λ 초기값 1.0으로 엄격한 시작
 
-# B. 매매 빈도 제약: 손실 매매 시 cost 발생
-MIN_PROFIT_PCT = 0.0              # 0% 미만 = 손실 매매
-LOSS_COST_SCALE = 0.5             # 손실률에 비례한 cost 스케일
-SL_EXIT_COST_MULTIPLIER = 2.0     # SL_EXIT 시 cost ×2 (5.0→2.0 완화)
+# A. 드로다운 제약
+DRAWDOWN_COST_THRESHOLD = 0.20    # 20% 드로다운 초과 시
+DRAWDOWN_COST_SCALE = 0.1         # Cost 압도 방지
 
-# C. 사후 평가 연동: 기회비용 > N% 시 cost 발생
-HINDSIGHT_COST_THRESHOLD = 0.02   # 2% 이상 기회비용 시 cost
-HINDSIGHT_COST_SCALE = 0.5        # 기회비용 cost 스케일
+# B. 매매 빈도 제약 (v5: 수수료 미달 100배 페널티)
+LEVERAGE = 35                     # 실제 사용 레버리지
+TAKER_FEE_PCT = 0.055 * 2         # 왕복 수수료 0.11% (명목 기준)
+# 증거금 대비 수수료 = 명목 수수료 × 레버리지
+# 50x 레버리지: 0.11% × 50 = 5.5% (증거금 대비)
+# _last_exit_pnl_pct는 퍼센트 단위 (5.0 = 5%)
+MIN_PROFIT_PCT = TAKER_FEE_PCT * LEVERAGE  # 5.5 = 5.5% 수익 필요
+LOSS_COST_SCALE = 10.0            # 1.0→10.0: 손실 매매 100배 페널티
+FEE_PENALTY_MULTIPLIER = 100.0    # 수수료 미달 수익 시 추가 100배
+SL_EXIT_COST_MULTIPLIER = 2.0     # SL_EXIT 시 cost ×2
+EARLY_EXIT_COST_SCALE = 5.0       # 2.0→5.0: 조기 청산 cost 강화
 
-# Lagrangian 승수 설정 (v2 - 안정화)
-COST_LIMIT = 1.0                  # 에피소드당 평균 cost 상한 (0.2→1.0 현실화)
-LAMBDA_LR = 0.01                  # λ 학습률 (0.02→0.01 안정화)
-LAMBDA_MAX = 2.0                  # λ 최대값 (10.0→2.0 페널티 과잉 방지)
+# C. 추세 일치 제약 (v5 신규)
+TREND_VIOLATION_COST = 10.0       # 추세 역행 진입 시 즉시 최대 Cost
+EMA_PERIOD = 200                  # 추세 판단용 EMA 기간
+
+# D. 사후 평가 연동
+HINDSIGHT_COST_THRESHOLD = 0.02
+HINDSIGHT_COST_SCALE = 0.0        # 비활성화
+TREND_BONUS_SCALE = 10.0          # 추세 끝까지 먹었을 때 보너스
+
+# E. 최소 홀딩 기간 (v5: 100스텝 = ~8시간)
+MIN_HOLDING_STEPS = 100           # 6→100: 약 8시간 강제 홀딩
+IDLE_REWARD_SCALE = 0.001         # 관망 시 미세 보상
+
+# Lagrangian 승수 설정 (v5: 초기값 1.0으로 엄격)
+COST_LIMIT = 5.0                  # 에피소드당 평균 cost 상한
+LAMBDA_INIT = 1.0                 # λ 초기값 1.0 (0에서 시작 X)
+LAMBDA_LR = 0.01                  # λ 학습률
+LAMBDA_MAX = 5.0                  # 0.5→5.0: 더 강한 제약 허용
 LAMBDA_UPDATE_FREQ = 50           # 50 에피소드마다 업데이트
 
 
@@ -140,21 +163,48 @@ def compute_indicators(df, prefix=''):
     ema26 = df['close'].ewm(span=26).mean()
     macd = ema12 - ema26
     macd_signal = macd.ewm(span=9).mean()
+    macd_hist = macd - macd_signal
 
     high_low = df['high'] - df['low']
     high_close = abs(df['high'] - df['close'].shift())
     low_close = abs(df['low'] - df['close'].shift())
     atr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
 
+    # 기존 피처
     df[f'{p}ma7_ratio'] = (df['close'] - ma7) / (ma7 + 1e-9)
     df[f'{p}ma25_ratio'] = (df['close'] - ma25) / (ma25 + 1e-9)
     df[f'{p}macd_ratio'] = macd / (df['close'] + 1e-9)
     df[f'{p}macd_signal_ratio'] = macd_signal / (df['close'] + 1e-9)
     df[f'{p}atr_ratio'] = atr / (df['close'] + 1e-9)
 
+    # === 추세 방향 피처 (v3 추가) ===
+    # 1. MA 기울기: 추세 방향 (+:상승, -:하락)
+    df[f'{p}ma7_slope'] = (ma7 - ma7.shift(5)) / (ma7.shift(5) + 1e-9)
+    df[f'{p}ma25_slope'] = (ma25 - ma25.shift(5)) / (ma25.shift(5) + 1e-9)
+
+    # 2. 모멘텀: 최근 N봉 누적 수익률
+    df[f'{p}momentum_10'] = df['close'].pct_change(10)
+    df[f'{p}momentum_20'] = df['close'].pct_change(20)
+
+    # 3. 추세 강도: MA7과 MA25 괴리율 (높을수록 추세 뚜렷)
+    df[f'{p}trend_strength'] = (ma7 - ma25).abs() / (ma25 + 1e-9)
+
+    # 4. MACD 히스토그램 변화: 추세 가속도
+    df[f'{p}macd_hist_change'] = macd_hist.diff(3) / (df['close'] + 1e-9)
+
+    # 5. EMA200 기준 추세 위치 (v5 추가): +1=상승추세, -1=하락추세
+    ema200 = df['close'].ewm(span=200).mean()
+    df[f'{p}ema200_position'] = (df['close'] - ema200) / (ema200 + 1e-9)
+
     feature_cols = [
+        # 기존 9개
         f'{p}returns', f'{p}ma7_ratio', f'{p}ma25_ratio', f'{p}volatility',
-        f'{p}rsi', f'{p}bb_pct', f'{p}macd_ratio', f'{p}macd_signal_ratio', f'{p}atr_ratio'
+        f'{p}rsi', f'{p}bb_pct', f'{p}macd_ratio', f'{p}macd_signal_ratio', f'{p}atr_ratio',
+        # 추세 방향 6개 (v3 추가)
+        f'{p}ma7_slope', f'{p}ma25_slope', f'{p}momentum_10', f'{p}momentum_20',
+        f'{p}trend_strength', f'{p}macd_hist_change',
+        # EMA200 위치 (v5 추가)
+        f'{p}ema200_position'
     ]
     return df, feature_cols
 
@@ -495,24 +545,15 @@ class LeverageProEnvV2(LeverageProEnv):
 # ==========================================
 class LeverageProEnvV3(LeverageProEnvV2):
     """
-    V3: Constrained PPO 환경 - Lagrangian Cost 제약 (v2 수정판)
+    V3: Constrained PPO 환경 - Lagrangian Cost 제약 (v5 극단적 단타 봉쇄)
 
-    핵심 변경: Cost를 "스텝당" → "거래당"으로 변경하여 스케일 정상화
+    v5 핵심 변경:
+    1. 최소 100스텝(~8시간) 강제 홀딩
+    2. 수수료 미달 수익 시 Cost 100배 (FEE_PENALTY_MULTIPLIER)
+    3. 추세 역행 진입 시 즉시 최대 Cost (TREND_VIOLATION_COST)
+    4. λ 초기값 1.0으로 엄격한 시작
 
-    V2의 Reward + Hindsight를 그대로 유지하면서,
-    3가지 Cost 신호를 거래 종료 시점에만 계산합니다.
-
-    A. 드로다운 제약 (Drawdown Constraint) - 거래 종료 시
-       거래 종료 시점의 포트폴리오 드로다운이 threshold 초과 시 cost 발생
-       → 드로다운 상태에서 손실 확정하는 행위 억제
-
-    B. 매매 손실 제약 (Loss Constraint) - 거래 종료 시
-       손실 매매 시 손실률에 비례한 cost 발생
-       → 잦은 손실 매매를 억제
-
-    C. 기회비용 제약 (Opportunity Cost) - 거래 종료 시
-       사후 평가에서 기회비용이 threshold 초과 시 cost 발생
-       → 너무 일찍 청산하는 행위 억제
+    원칙: 추세를 거스르는 것 자체가 "금지된 행동"
     """
 
     def __init__(self, datasets, stats, leverage=35, initial_capital=100.0,
@@ -520,8 +561,12 @@ class LeverageProEnvV3(LeverageProEnvV2):
                  drawdown_threshold=0.10, drawdown_cost_scale=1.0,
                  min_profit_pct=0.0, loss_cost_scale=0.5,
                  hindsight_cost_threshold=0.02, hindsight_cost_scale=0.5,
-                 sl_exit_cost_multiplier=2.0, holding_reward_scale=0.02):
-        # Cost 설정 (v2)
+                 sl_exit_cost_multiplier=2.0, holding_reward_scale=0.02,
+                 min_holding_steps=100, early_exit_cost_scale=5.0,
+                 trend_bonus_scale=10.0, idle_reward_scale=0.001,
+                 fee_penalty_multiplier=100.0, trend_violation_cost=10.0,
+                 lambda_init=1.0):
+        # Cost 설정 (v5: 극단적 단타 봉쇄)
         self.drawdown_threshold = drawdown_threshold
         self.drawdown_cost_scale = drawdown_cost_scale
         self.min_profit_pct = min_profit_pct
@@ -531,15 +576,27 @@ class LeverageProEnvV3(LeverageProEnvV2):
         self.sl_exit_cost_multiplier = sl_exit_cost_multiplier
         self.holding_reward_scale = holding_reward_scale
 
-        # Lagrangian 승수 (LagrangianCallback이 동적으로 조절)
-        self.cost_lambda = 0.0
+        # v5 강화: 단타 봉쇄 설정
+        self.min_holding_steps = min_holding_steps      # 최소 홀딩 기간 (100스텝)
+        self.early_exit_cost_scale = early_exit_cost_scale  # 조기 청산 추가 cost
+        self.trend_bonus_scale = trend_bonus_scale      # 추세 보너스 스케일
+        self.idle_reward_scale = idle_reward_scale      # 관망 보상
+
+        # v5 신규: 수수료 미달 및 추세 역행 페널티
+        self.fee_penalty_multiplier = fee_penalty_multiplier  # 수수료 미달 시 100배
+        self.trend_violation_cost = trend_violation_cost      # 추세 역행 진입 시 cost
+
+        # Lagrangian 승수 (v5: 초기값 1.0으로 엄격)
+        self.cost_lambda = lambda_init  # 0.0 → 1.0
 
         # Cost 추적
         self._peak_equity = initial_capital
         self._episode_cost = 0.0
         self._last_missed_gain_pct = 0.0
         self._last_exit_reason = ""
-        self._last_exit_pnl_pct = 0.0  # 거래 종료 시 PnL% 저장
+        self._last_exit_pnl_pct = 0.0
+        self._last_holding_duration = 0
+        self._trend_violation_this_step = False  # 추세 역행 진입 감지
 
         super().__init__(datasets, stats, leverage, initial_capital,
                          entry_size, hindsight_steps, hindsight_scale)
@@ -551,13 +608,15 @@ class LeverageProEnvV3(LeverageProEnvV2):
         self._last_missed_gain_pct = 0.0
         self._last_exit_reason = ""
         self._last_exit_pnl_pct = 0.0
+        self._last_holding_duration = 0
         return obs, info
 
     def _close_position(self, reason="EXIT"):
-        """V2 + 종료 사유/PnL 기록"""
+        """V2 + 종료 사유/PnL/홀딩기간 기록"""
         self._last_exit_reason = reason
+        self._last_holding_duration = self.time - self.entry_time  # 홀딩 기간 저장
         pnl_pct, duration = super()._close_position(reason)
-        self._last_exit_pnl_pct = pnl_pct  # Cost B 계산용
+        self._last_exit_pnl_pct = pnl_pct
         return pnl_pct, duration
 
     def _calculate_hindsight_reward(self, exit_price, position_side):
@@ -597,62 +656,114 @@ class LeverageProEnvV3(LeverageProEnvV2):
         return (opportunity_penalty + risk_bonus) * scale * self.hindsight_scale
 
     def step(self, actions):
+        action = float(actions[0])
+        self._trend_violation_this_step = False
+
+        # === v5: 추세 역행 진입 감지 (EMA200 기준) ===
+        # 현재 가격이 EMA200 아래인데 롱 진입 시도 → 금지
+        # 현재 가격이 EMA200 위인데 숏 진입 시도 → 금지
+        # tech_array의 마지막 피처가 ema200_position
+        ema200_position = self.tech_array[self.time][-1]  # 양수=EMA 위, 음수=EMA 아래
+
+        if self.position == 0 and abs(action) > 0.8:  # 진입 시도
+            # 롱 진입인데 EMA200 아래 → 추세 역행
+            if action > 0.8 and ema200_position < 0:
+                self._trend_violation_this_step = True
+            # 숏 진입인데 EMA200 위 → 추세 역행
+            elif action < -0.8 and ema200_position > 0:
+                self._trend_violation_this_step = True
+
+        # === v5: 최소 홀딩 기간 강제 (100스텝) ===
+        if self.position != 0:
+            holding_duration = self.time - self.entry_time
+            if holding_duration < self.min_holding_steps:
+                if abs(action) < 0.3 or (action * self.position < 0):
+                    action = 0.5 if self.position > 0 else -0.5
+                    actions = np.array([action])
+
         # V2.step() 호출: base reward + hindsight
-        # (V2.step 내부에서 _last_exit_happened 리셋 후 V1.step 실행)
         obs, reward, done, truncated, info = super().step(actions)
 
-        # === Cost 계산 (v2: 거래 종료 시에만 계산) ===
+        # === Cost 계산 (v5: 극단적 단타 봉쇄) ===
         cost_a = 0.0  # 드로다운
-        cost_b = 0.0  # 매매 손실
-        cost_c = 0.0  # 기회비용
+        cost_b = 0.0  # 매매 손실 (수수료 미달 100배)
+        cost_c = 0.0  # 기회비용 (비활성화)
+        cost_d = 0.0  # 조기 청산
+        cost_e = 0.0  # 추세 역행 (v5 신규)
 
-        # 고점 자산 추적 (Cost A 계산용)
+        # 고점 자산 추적
         self._peak_equity = max(self._peak_equity, self.total_asset)
         current_drawdown = (self._peak_equity - self.total_asset) / self._peak_equity
 
-        # === 거래 종료 시에만 Cost 부과 (스텝당 → 거래당) ===
+        # === v5: 추세 역행 진입 시 즉시 최대 Cost ===
+        if self._trend_violation_this_step:
+            cost_e = self.trend_violation_cost
+            info['trend_violation'] = True
+
+        # === 거래 종료 시 Cost 부과 ===
         if self._last_exit_happened:
-            # A. 드로다운 제약: 거래 종료 시점에 드로다운 상태면 cost 부과
-            #    → 드로다운 상태에서 손실 확정하는 행위 억제
+            # A. 드로다운 제약
             if current_drawdown > self.drawdown_threshold:
                 excess_dd = current_drawdown - self.drawdown_threshold
                 cost_a = excess_dd * self.drawdown_cost_scale
 
-            # B. 매매 손실 제약: 손실 매매 시 손실률에 비례한 cost 부과
-            #    → SL_EXIT는 가중 페널티 (어설프게 버티다 손절 억제)
+            # B. 매매 손실 제약 (v5: 수수료 미달 시 100배)
             if self._last_exit_pnl_pct < self.min_profit_pct:
                 loss_pct = abs(self._last_exit_pnl_pct - self.min_profit_pct)
                 cost_b = (loss_pct / 100) * self.loss_cost_scale
+
+                # v5: 수수료도 못 벌었으면 100배 추가 페널티
+                if self._last_exit_pnl_pct < 0 and self._last_exit_pnl_pct > -self.min_profit_pct:
+                    # 수익이 0~수수료 사이 (사실상 손실)
+                    cost_b *= self.fee_penalty_multiplier
+
                 if self._last_exit_reason == "SL_EXIT":
                     cost_b *= self.sl_exit_cost_multiplier
 
-            # C. 기회비용 제약: 사후 평가에서 기회비용 > 임계값 시 cost 부과
-            #    → 너무 일찍 청산하는 행위 억제
+            # C. 기회비용 제약 (비활성화)
             if self._last_missed_gain_pct > self.hindsight_cost_threshold:
                 excess_opp = self._last_missed_gain_pct - self.hindsight_cost_threshold
                 cost_c = excess_opp * self.hindsight_cost_scale
 
-        step_cost = cost_a + cost_b + cost_c
+            # D. 조기 청산 추가 cost (v5: 100스텝 미달)
+            if self._last_holding_duration < self.min_holding_steps:
+                if self._last_exit_reason == "AI_EXIT":
+                    cost_d = self.early_exit_cost_scale
+
+            # === 추세 보너스 (수익 청산 시) ===
+            if self._last_exit_pnl_pct > 0:
+                holding_ratio = min(self._last_holding_duration / self.min_holding_steps, 3.0)
+                trend_bonus = (self._last_exit_pnl_pct / 100) * holding_ratio * self.trend_bonus_scale
+                reward += trend_bonus
+                info['trend_bonus'] = trend_bonus
+
+        step_cost = cost_a + cost_b + cost_c + cost_d + cost_e
         self._episode_cost += step_cost
 
-        # Lagrangian: effective_reward = reward - λ × cost
+        # Lagrangian: effective_reward = reward - λ × cost (v5: λ 초기값 1.0)
         reward -= self.cost_lambda * step_cost
 
         # === 홀딩 보상: 수익 중인 포지션 보유 시 양의 보상 ===
-        # "비용으로 겁주기" 대신 "이득으로 유혹"하여 홀딩 기간 연장
         if self.position != 0 and self.unrealized_pnl > 0:
             profit_ratio = self.unrealized_pnl / self.entry_size
             holding_bonus = profit_ratio * self.holding_reward_scale
             reward += holding_bonus
 
-        # info에 cost 정보 기록 (콜백에서 모니터링용)
+        # === 관망 보상 (action ~0일 때) ===
+        if self.position == 0 and abs(action) < 0.3:
+            reward += self.idle_reward_scale
+
+        # info에 cost 정보 기록
         info['cost'] = step_cost
         info['cost_a'] = cost_a
         info['cost_b'] = cost_b
         info['cost_c'] = cost_c
+        info['cost_d'] = cost_d
+        info['cost_e'] = cost_e  # 추세 역행 cost
         info['episode_cost'] = self._episode_cost
         info['cost_lambda'] = self.cost_lambda
-        info['drawdown'] = current_drawdown  # 모니터링용
+        info['drawdown'] = current_drawdown
+        info['ema200_position'] = ema200_position
 
         return obs, reward, done, truncated, info
 
@@ -904,36 +1015,34 @@ print("=" * 60)
 print(f"📊 학습: {len(TRAIN_SYMBOLS)}종목 ({', '.join(TRAIN_SYMBOLS)})")
 print(f"📊 테스트: {TEST_SYMBOL}")
 print(f"📈 학습 데이터: {total_train_samples:,}개 / 테스트: {len(test_prices):,}개")
-print(f"📐 피처: 5m(9) + 1h(9) = 18 + 포지션(4) = 22차원 상태")
+print(f"📐 피처: 5m(16) + 1h(16) = 32 + 포지션(4) = 36차원 상태 (v5: EMA200 피처 추가)")
 print(f"🧠 모델 아키텍처: {MODEL_TYPE}")
-print(f"⚡ 레버리지: 30x (Isolated)")
+print(f"⚡ 레버리지: {LEVERAGE}x (Isolated)")
 print(f"💾 RUN_ID: {RUN_ID}" + (f" (initialize-from: {INITIALIZE_FROM})" if INITIALIZE_FROM else ""))
 
-print(f"\n🛡️ CPPO 제약 설정 (v2 - 거래당 Cost):")
-print(f"   A. 드로다운 제약: 거래 종료 시 >{DRAWDOWN_COST_THRESHOLD*100:.0f}% 드로다운 시 cost "
-      f"(scale={DRAWDOWN_COST_SCALE})")
-print(f"   B. 매매 손실 제약: <{MIN_PROFIT_PCT:.1f}% 수익 시 cost "
-      f"(scale={LOSS_COST_SCALE}, SL_EXIT ×{SL_EXIT_COST_MULTIPLIER:.0f})")
-print(f"   C. 기회비용 제약: >{HINDSIGHT_COST_THRESHOLD*100:.0f}% 상실 시 cost "
-      f"(scale={HINDSIGHT_COST_SCALE})")
-print(f"   λ 설정: limit={COST_LIMIT}, lr={LAMBDA_LR}, "
-      f"max={LAMBDA_MAX}, update_freq={LAMBDA_UPDATE_FREQ}")
-print(f"   ⚠️ v2 핵심 변경: Cost가 스텝당 → 거래당으로 변경됨")
+print(f"\n🛡️ CPPO 제약 설정 (v5 - 극단적 단타 봉쇄 + 추세 강제):")
+print(f"   A. 드로다운 제약: >{DRAWDOWN_COST_THRESHOLD*100:.0f}% 시 cost (scale={DRAWDOWN_COST_SCALE})")
+print(f"   B. 매매 손실 제약: 손실 시 cost (scale={LOSS_COST_SCALE}, SL_EXIT ×{SL_EXIT_COST_MULTIPLIER:.0f})")
+print(f"      ⚠️ v5: 수수료({MIN_PROFIT_PCT:.2f}%) 미달 수익 시 {FEE_PENALTY_MULTIPLIER:.0f}배 추가 페널티")
+print(f"   C. 기회비용 제약: (scale={HINDSIGHT_COST_SCALE}) — 0이면 비활성화")
+print(f"   D. 조기 청산 제약: <{MIN_HOLDING_STEPS}스텝 청산 시 추가 cost (scale={EARLY_EXIT_COST_SCALE})")
+print(f"   E. 추세 역행 제약: EMA200 역행 진입 시 즉시 cost={TREND_VIOLATION_COST}")
+print(f"   λ 설정: init={LAMBDA_INIT}, limit={COST_LIMIT}, lr={LAMBDA_LR}, max={LAMBDA_MAX}")
+print(f"   ⚠️ v5 핵심: 최소 {MIN_HOLDING_STEPS}스텝(~8시간) 강제 홀딩 + EMA200 추세 강제")
 
-print(f"\n💡 보상 함수 구성 (Equity-Change + Sharpe + Hindsight + CPPO):")
-print("   - 매 스텝: delta(equity) / initial_equity — 실제 자산 변화 직결")
-print("   - 매 스텝: 변동성 페널티 (-std × 0.01) — 과도한 리스크 억제")
+print(f"\n💡 보상 함수 구성 (v5: 극단적 단타 봉쇄 + 추세 강제):")
+print("   - 매 스텝: delta(equity) / initial_equity")
 print(f"   - 사후 평가(Hindsight): 기회비용/리스크회피 보상 (scale={HINDSIGHT_SCALE})")
 print(f"   - 홀딩 보상: 수익 중 포지션 유지 시 +보상 (scale={HOLDING_REWARD_SCALE})")
-print("   - 에피소드 종료: Sharpe Ratio 보너스 (안정적 수익 유도)")
-print("   - CPPO: reward -= λ × cost (λ 자동 조절)")
-print("   - VecNormalize: 자동 보상 스케일링")
+print(f"   - 추세 보너스: 긴 홀딩 + 수익 청산 시 대형 보너스 (scale={TREND_BONUS_SCALE})")
+print(f"   - 관망 보상: action ~0 시 미세 보상 (scale={IDLE_REWARD_SCALE})")
+print("   - CPPO: reward -= λ × cost (λ={LAMBDA_INIT}에서 시작)")
 print("=" * 60)
 
-# V3 CPPO 환경 생성 (v2 파라미터)
+# V3 CPPO 환경 생성 (v5 파라미터: 극단적 단타 봉쇄 + 추세 강제)
 def make_train_env():
     return LeverageProEnvV3(
-        train_datasets, data_stats, leverage=30,
+        train_datasets, data_stats, leverage=LEVERAGE,
         hindsight_steps=HINDSIGHT_STEPS, hindsight_scale=HINDSIGHT_SCALE,
         drawdown_threshold=DRAWDOWN_COST_THRESHOLD,
         drawdown_cost_scale=DRAWDOWN_COST_SCALE,
@@ -943,6 +1052,15 @@ def make_train_env():
         hindsight_cost_scale=HINDSIGHT_COST_SCALE,
         sl_exit_cost_multiplier=SL_EXIT_COST_MULTIPLIER,
         holding_reward_scale=HOLDING_REWARD_SCALE,
+        # v4: 단타 봉쇄 + 추세 추종
+        min_holding_steps=MIN_HOLDING_STEPS,
+        early_exit_cost_scale=EARLY_EXIT_COST_SCALE,
+        trend_bonus_scale=TREND_BONUS_SCALE,
+        idle_reward_scale=IDLE_REWARD_SCALE,
+        # v5 신규: 수수료 미달 100배 + 추세 역행 즉시 페널티 + λ 초기값 1.0
+        fee_penalty_multiplier=FEE_PENALTY_MULTIPLIER,
+        trend_violation_cost=TREND_VIOLATION_COST,
+        lambda_init=LAMBDA_INIT,
     )
 
 print(f"\n🔬 환경: LeverageProEnvV3 (CPPO + Hindsight)")
@@ -952,7 +1070,7 @@ train_env = VecNormalize(train_env, norm_obs=False, norm_reward=True,
                          clip_reward=10.0, gamma=0.98)
 
 model = create_model(train_env, MODEL_TYPE, initialize_from=INITIALIZE_FROM)
-total_timesteps_num = 1000000
+total_timesteps_num = 800000
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -975,7 +1093,7 @@ init_msg = f" (initialize-from: {INITIALIZE_FROM})" if INITIALIZE_FROM else " (�
 print(f"\n🏋️ CPPO 학습 시작...{init_msg}")
 print(f"   💾 저장 경로: {SAVE_DIR}")
 print(f"   💾 체크포인트: {CHECKPOINT_FREQ:,} 스텝마다 자동 저장")
-print(f"   🛡️ λ = 0.0 에서 시작 (제약 위반 시 자동 증가)")
+print(f"   🛡️ λ = {LAMBDA_INIT} 에서 시작 (v5: 엄격한 제약 초기값)")
 
 model.learn(total_timesteps=total_timesteps_num,
             callback=[lagrangian_cb, checkpoint_cb])
