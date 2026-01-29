@@ -79,24 +79,26 @@ HINDSIGHT_SCALE = 1.0       # 0.5→1.0: "더 버텨서 큰 수익" 리워드 �
 HOLDING_REWARD_SCALE = 0.02 # 수익 중 포지션 보유 시 스텝당 보상
 
 # ==========================================
-# CPPO 제약 설정
+# CPPO 제약 설정 (v2 - 스케일 수정)
 # ==========================================
-# A. 드로다운 제약: 고점 대비 N% 초과 시 cost 발생
+# A. 드로다운 제약: 거래 종료 시 드로다운 상태면 cost 발생 (스텝당 → 거래당)
 DRAWDOWN_COST_THRESHOLD = 0.10    # 10% 드로다운 초과 시
-DRAWDOWN_COST_SCALE = 2.0         # 5.0→2.0: 드로다운 cost 압도 방지
+DRAWDOWN_COST_SCALE = 1.0         # 거래당 1회만 부과되므로 스케일 단순화
 
 # B. 매매 빈도 제약: 손실 매매 시 cost 발생
 MIN_PROFIT_PCT = 0.0              # 0% 미만 = 손실 매매
-SL_EXIT_COST_MULTIPLIER = 5.0     # SL_EXIT 시 cost ×5 폭증 (어설픈 버티기 억제)
+LOSS_COST_SCALE = 0.5             # 손실률에 비례한 cost 스케일
+SL_EXIT_COST_MULTIPLIER = 2.0     # SL_EXIT 시 cost ×2 (5.0→2.0 완화)
 
 # C. 사후 평가 연동: 기회비용 > N% 시 cost 발생
-HINDSIGHT_COST_THRESHOLD = 0.03   # 0.02→0.03: cost C 완화 (reward로 유도)
+HINDSIGHT_COST_THRESHOLD = 0.02   # 2% 이상 기회비용 시 cost
+HINDSIGHT_COST_SCALE = 0.5        # 기회비용 cost 스케일
 
-# Lagrangian 승수 설정
-COST_LIMIT = 0.20                 # 에피소드 평균 cost 상한 (0.15→0.20: 추세 추종 여유)
-LAMBDA_LR = 0.02                  # 0.05→0.02: λ가 너무 빨리 최대치 도달 방지
-LAMBDA_MAX = 10.0                 # λ 최대값
-LAMBDA_UPDATE_FREQ = 40           # 20→40: 충분한 탐색 후 업데이트
+# Lagrangian 승수 설정 (v2 - 안정화)
+COST_LIMIT = 1.0                  # 에피소드당 평균 cost 상한 (0.2→1.0 현실화)
+LAMBDA_LR = 0.01                  # λ 학습률 (0.02→0.01 안정화)
+LAMBDA_MAX = 2.0                  # λ 최대값 (10.0→2.0 페널티 과잉 방지)
+LAMBDA_UPDATE_FREQ = 50           # 50 에피소드마다 업데이트
 
 
 # ==========================================
@@ -493,37 +495,39 @@ class LeverageProEnvV2(LeverageProEnv):
 # ==========================================
 class LeverageProEnvV3(LeverageProEnvV2):
     """
-    V3: Constrained PPO 환경 - Lagrangian Cost 제약
+    V3: Constrained PPO 환경 - Lagrangian Cost 제약 (v2 수정판)
+
+    핵심 변경: Cost를 "스텝당" → "거래당"으로 변경하여 스케일 정상화
 
     V2의 Reward + Hindsight를 그대로 유지하면서,
-    3가지 Cost 신호를 추가로 계산합니다.
+    3가지 Cost 신호를 거래 종료 시점에만 계산합니다.
 
-    Cost는 reward와 별도로 계산되며, Lagrangian 승수(λ)를 통해
-    effective_reward = reward - λ × cost 로 변환됩니다.
+    A. 드로다운 제약 (Drawdown Constraint) - 거래 종료 시
+       거래 종료 시점의 포트폴리오 드로다운이 threshold 초과 시 cost 발생
+       → 드로다운 상태에서 손실 확정하는 행위 억제
 
-    A. 드로다운 제약 (Drawdown Constraint)
-       고점 대비 drawdown이 threshold(10%)를 넘으면 cost 발생
-       → 큰 손실이 누적되기 전에 포지션 정리를 유도
+    B. 매매 손실 제약 (Loss Constraint) - 거래 종료 시
+       손실 매매 시 손실률에 비례한 cost 발생
+       → 잦은 손실 매매를 억제
 
-    B. 매매 빈도 제약 (Transaction Cost Constraint)
-       매매 수익이 수수료를 충당하지 못하면 cost 발생
-       → 잦은 손실 매매를 물리적으로 억제
-
-    C. 사후 평가 연동 (Hindsight-based Cost)
-       기회비용 상실이 threshold(2%)를 넘으면 cost 발생
-       → "너무 일찍 파는 것"을 규칙 위반으로 간주
+    C. 기회비용 제약 (Opportunity Cost) - 거래 종료 시
+       사후 평가에서 기회비용이 threshold 초과 시 cost 발생
+       → 너무 일찍 청산하는 행위 억제
     """
 
     def __init__(self, datasets, stats, leverage=35, initial_capital=100.0,
                  entry_size=5.0, hindsight_steps=20, hindsight_scale=0.3,
-                 drawdown_threshold=0.10, drawdown_cost_scale=5.0,
-                 min_profit_pct=0.0, hindsight_cost_threshold=0.02,
-                 sl_exit_cost_multiplier=5.0, holding_reward_scale=0.02):
-        # Cost 설정
+                 drawdown_threshold=0.10, drawdown_cost_scale=1.0,
+                 min_profit_pct=0.0, loss_cost_scale=0.5,
+                 hindsight_cost_threshold=0.02, hindsight_cost_scale=0.5,
+                 sl_exit_cost_multiplier=2.0, holding_reward_scale=0.02):
+        # Cost 설정 (v2)
         self.drawdown_threshold = drawdown_threshold
         self.drawdown_cost_scale = drawdown_cost_scale
         self.min_profit_pct = min_profit_pct
+        self.loss_cost_scale = loss_cost_scale
         self.hindsight_cost_threshold = hindsight_cost_threshold
+        self.hindsight_cost_scale = hindsight_cost_scale
         self.sl_exit_cost_multiplier = sl_exit_cost_multiplier
         self.holding_reward_scale = holding_reward_scale
 
@@ -535,6 +539,7 @@ class LeverageProEnvV3(LeverageProEnvV2):
         self._episode_cost = 0.0
         self._last_missed_gain_pct = 0.0
         self._last_exit_reason = ""
+        self._last_exit_pnl_pct = 0.0  # 거래 종료 시 PnL% 저장
 
         super().__init__(datasets, stats, leverage, initial_capital,
                          entry_size, hindsight_steps, hindsight_scale)
@@ -545,12 +550,15 @@ class LeverageProEnvV3(LeverageProEnvV2):
         self._episode_cost = 0.0
         self._last_missed_gain_pct = 0.0
         self._last_exit_reason = ""
+        self._last_exit_pnl_pct = 0.0
         return obs, info
 
     def _close_position(self, reason="EXIT"):
-        """V2 + 종료 사유 기록 (SL_EXIT 비용 폭증용)"""
+        """V2 + 종료 사유/PnL 기록"""
         self._last_exit_reason = reason
-        return super()._close_position(reason)
+        pnl_pct, duration = super()._close_position(reason)
+        self._last_exit_pnl_pct = pnl_pct  # Cost B 계산용
+        return pnl_pct, duration
 
     def _calculate_hindsight_reward(self, exit_price, position_side):
         """V2 사후 평가 + Cost C용 기회비용(missed_gain_pct) 기록"""
@@ -593,29 +601,36 @@ class LeverageProEnvV3(LeverageProEnvV2):
         # (V2.step 내부에서 _last_exit_happened 리셋 후 V1.step 실행)
         obs, reward, done, truncated, info = super().step(actions)
 
-        # === Cost 계산 ===
+        # === Cost 계산 (v2: 거래 종료 시에만 계산) ===
         cost_a = 0.0  # 드로다운
         cost_b = 0.0  # 매매 손실
         cost_c = 0.0  # 기회비용
 
-        # A. 드로다운 제약: 고점 대비 초과 하락분에 cost 부과
+        # 고점 자산 추적 (Cost A 계산용)
         self._peak_equity = max(self._peak_equity, self.total_asset)
-        drawdown = (self._peak_equity - self.total_asset) / self._peak_equity
-        if drawdown > self.drawdown_threshold:
-            cost_a = (drawdown - self.drawdown_threshold) * self.drawdown_cost_scale
+        current_drawdown = (self._peak_equity - self.total_asset) / self._peak_equity
 
-        # B. 매매 빈도 제약: 손실 매매 시 cost 부과
-        #    SL_EXIT인 경우 cost ×N 폭증 → "어설프게 버티다 손절" 억제
+        # === 거래 종료 시에만 Cost 부과 (스텝당 → 거래당) ===
         if self._last_exit_happened:
-            pnl_pct = info.get('pnl_pct', 0)
-            if pnl_pct < self.min_profit_pct:
-                cost_b = abs(self.min_profit_pct - pnl_pct) / 100
+            # A. 드로다운 제약: 거래 종료 시점에 드로다운 상태면 cost 부과
+            #    → 드로다운 상태에서 손실 확정하는 행위 억제
+            if current_drawdown > self.drawdown_threshold:
+                excess_dd = current_drawdown - self.drawdown_threshold
+                cost_a = excess_dd * self.drawdown_cost_scale
+
+            # B. 매매 손실 제약: 손실 매매 시 손실률에 비례한 cost 부과
+            #    → SL_EXIT는 가중 페널티 (어설프게 버티다 손절 억제)
+            if self._last_exit_pnl_pct < self.min_profit_pct:
+                loss_pct = abs(self._last_exit_pnl_pct - self.min_profit_pct)
+                cost_b = (loss_pct / 100) * self.loss_cost_scale
                 if self._last_exit_reason == "SL_EXIT":
                     cost_b *= self.sl_exit_cost_multiplier
 
-        # C. 사후 평가 연동: 기회비용 > 임계값 시 cost 부과
-        if self._last_exit_happened and self._last_missed_gain_pct > self.hindsight_cost_threshold:
-            cost_c = (self._last_missed_gain_pct - self.hindsight_cost_threshold)
+            # C. 기회비용 제약: 사후 평가에서 기회비용 > 임계값 시 cost 부과
+            #    → 너무 일찍 청산하는 행위 억제
+            if self._last_missed_gain_pct > self.hindsight_cost_threshold:
+                excess_opp = self._last_missed_gain_pct - self.hindsight_cost_threshold
+                cost_c = excess_opp * self.hindsight_cost_scale
 
         step_cost = cost_a + cost_b + cost_c
         self._episode_cost += step_cost
@@ -637,6 +652,7 @@ class LeverageProEnvV3(LeverageProEnvV2):
         info['cost_c'] = cost_c
         info['episode_cost'] = self._episode_cost
         info['cost_lambda'] = self.cost_lambda
+        info['drawdown'] = current_drawdown  # 모니터링용
 
         return obs, reward, done, truncated, info
 
@@ -893,14 +909,16 @@ print(f"🧠 모델 아키텍처: {MODEL_TYPE}")
 print(f"⚡ 레버리지: 30x (Isolated)")
 print(f"💾 RUN_ID: {RUN_ID}" + (f" (initialize-from: {INITIALIZE_FROM})" if INITIALIZE_FROM else ""))
 
-print(f"\n🛡️ CPPO 제약 설정:")
-print(f"   A. 드로다운 제약: >{DRAWDOWN_COST_THRESHOLD*100:.0f}% 초과 시 cost "
+print(f"\n🛡️ CPPO 제약 설정 (v2 - 거래당 Cost):")
+print(f"   A. 드로다운 제약: 거래 종료 시 >{DRAWDOWN_COST_THRESHOLD*100:.0f}% 드로다운 시 cost "
       f"(scale={DRAWDOWN_COST_SCALE})")
 print(f"   B. 매매 손실 제약: <{MIN_PROFIT_PCT:.1f}% 수익 시 cost "
-      f"(SL_EXIT ×{SL_EXIT_COST_MULTIPLIER:.0f})")
-print(f"   C. 기회비용 제약: >{HINDSIGHT_COST_THRESHOLD*100:.0f}% 상실 시 cost")
+      f"(scale={LOSS_COST_SCALE}, SL_EXIT ×{SL_EXIT_COST_MULTIPLIER:.0f})")
+print(f"   C. 기회비용 제약: >{HINDSIGHT_COST_THRESHOLD*100:.0f}% 상실 시 cost "
+      f"(scale={HINDSIGHT_COST_SCALE})")
 print(f"   λ 설정: limit={COST_LIMIT}, lr={LAMBDA_LR}, "
       f"max={LAMBDA_MAX}, update_freq={LAMBDA_UPDATE_FREQ}")
+print(f"   ⚠️ v2 핵심 변경: Cost가 스텝당 → 거래당으로 변경됨")
 
 print(f"\n💡 보상 함수 구성 (Equity-Change + Sharpe + Hindsight + CPPO):")
 print("   - 매 스텝: delta(equity) / initial_equity — 실제 자산 변화 직결")
@@ -912,7 +930,7 @@ print("   - CPPO: reward -= λ × cost (λ 자동 조절)")
 print("   - VecNormalize: 자동 보상 스케일링")
 print("=" * 60)
 
-# V3 CPPO 환경 생성
+# V3 CPPO 환경 생성 (v2 파라미터)
 def make_train_env():
     return LeverageProEnvV3(
         train_datasets, data_stats, leverage=30,
@@ -920,7 +938,9 @@ def make_train_env():
         drawdown_threshold=DRAWDOWN_COST_THRESHOLD,
         drawdown_cost_scale=DRAWDOWN_COST_SCALE,
         min_profit_pct=MIN_PROFIT_PCT,
+        loss_cost_scale=LOSS_COST_SCALE,
         hindsight_cost_threshold=HINDSIGHT_COST_THRESHOLD,
+        hindsight_cost_scale=HINDSIGHT_COST_SCALE,
         sl_exit_cost_multiplier=SL_EXIT_COST_MULTIPLIER,
         holding_reward_scale=HOLDING_REWARD_SCALE,
     )
